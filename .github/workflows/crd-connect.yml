@@ -1,0 +1,458 @@
+name: "CRD Connect"
+
+run-name: "0P ${{ inputs.TAG }} ${{ inputs.NAME }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      TAG:
+        description: "Server correlation tag (required for claim)"
+        required: true
+      HANDOFF:
+        description: "One-time handoff token"
+        required: true
+      APP_URL:
+        description: "Public app base URL for handoff/ready"
+        required: true
+      MODE:
+        description: "crd | rdp (Tailscale) | bore (bore.pub)"
+        required: false
+        default: "crd"
+      NAME:
+        description: "Display name"
+        required: false
+        default: ""
+      CODE:
+        description: "UNUSED — secrets come from handoff"
+        required: false
+        default: ""
+      PIN:
+        description: "UNUSED — secrets come from handoff"
+        required: false
+        default: ""
+
+jobs:
+  crd-connect:
+    runs-on: windows-latest
+    steps:
+      - name: "Setup & Connect"
+        shell: pwsh
+        env:
+          INPUT_TAG: ${{ github.event.inputs.TAG }}
+          INPUT_HANDOFF: ${{ github.event.inputs.HANDOFF }}
+          INPUT_APP_URL: ${{ github.event.inputs.APP_URL }}
+          INPUT_MODE: ${{ github.event.inputs.MODE }}
+          INPUT_NAME: ${{ github.event.inputs.NAME }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tag = ($env:INPUT_TAG).Trim()
+          $handoff = ($env:INPUT_HANDOFF).Trim()
+          $appUrl = ($env:INPUT_APP_URL).Trim().TrimEnd('/')
+          $mode = if ($env:INPUT_MODE) { $env:INPUT_MODE.Trim().ToLower() } else { 'crd' }
+          $nameHint = ($env:INPUT_NAME).Trim()
+
+          if (-not $tag -or -not $handoff -or -not $appUrl) {
+            throw "TAG, HANDOFF, and APP_URL are required"
+          }
+          if ($mode -ne 'crd' -and $mode -ne 'rdp' -and $mode -ne 'bore') { $mode = 'crd' }
+
+          Write-Host "::add-mask::$handoff"
+          Write-Host "Mode=$mode tag=$tag"
+
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class WinHide {
+            [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+          }
+          "@
+
+          function Hide-DesktopNoise {
+            $runnerProcs = @(
+              'Runner.Listener', 'Runner.Worker', 'Runner.Service', 'hosted-compute-agent'
+            )
+            $noiseRe = 'HostedComputeAgent|hosted-compute-agent|Runner\.(Listener|Worker|Service)|actions-runner|ProgramData\\GitHub|GitHub\\runner|\\actions\\runner'
+
+            Get-Process -ErrorAction SilentlyContinue | Where-Object {
+              if ($_.MainWindowHandle -eq [IntPtr]::Zero) { return $false }
+              if ($runnerProcs -contains $_.ProcessName) { return $true }
+              $title = $_.MainWindowTitle
+              if ($title -and ($title -match $noiseRe)) { return $true }
+              try {
+                $path = $_.Path
+                if ($path -and ($path -match $noiseRe)) { return $true }
+              } catch {}
+              return $false
+            } | ForEach-Object {
+              [void][WinHide]::ShowWindow($_.MainWindowHandle, 0)
+            }
+
+            try {
+              $self = Get-Process -Id $PID -ErrorAction SilentlyContinue
+              if ($self -and $self.MainWindowHandle -ne [IntPtr]::Zero) {
+                [void][WinHide]::ShowWindow($self.MainWindowHandle, 0)
+              }
+            } catch {}
+          }
+
+          function Set-0PWallpaper {
+            param([string]$BaseUrl)
+            try {
+              $destDir = "C:\Users\Public\Pictures"
+              New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+              $wpPath = Join-Path $destDir "0P-wallpaper.png"
+              $uri = "$BaseUrl/static/op-wallpaper.png"
+              Write-Host "Downloading 0.P wallpaper..."
+              Invoke-WebRequest -Uri $uri -OutFile $wpPath -UseBasicParsing -TimeoutSec 60
+              if (-not (Test-Path $wpPath)) { throw "Wallpaper download missing" }
+
+              # Apply to current interactive session (CRD / console)
+              $wpType = 'using System.Runtime.InteropServices; public class OpWallpaper { [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)] public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni); }'
+              Add-Type -TypeDefinition $wpType -ErrorAction SilentlyContinue
+              $SPI_SETDESKWALLPAPER = 20
+              $UPDATE_INI_FILE = 0x01
+              $SENDWININICHANGE = 0x02
+              Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name WallpaperStyle -Value '10' -Force -ErrorAction SilentlyContinue
+              Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name TileWallpaper -Value '0' -Force -ErrorAction SilentlyContinue
+              Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name Wallpaper -Value $wpPath -Force -ErrorAction SilentlyContinue
+              try { [void][OpWallpaper]::SystemParametersInfo($SPI_SETDESKWALLPAPER, 0, $wpPath, $UPDATE_INI_FILE -bor $SENDWININICHANGE) } catch {}
+
+              # Seed Default user so first-login RDP profiles pick it up
+              $defaultHive = 'C:\Users\Default\NTUSER.DAT'
+              if (Test-Path $defaultHive) {
+                reg load HKU\OpDefault "$defaultHive" 2>$null | Out-Null
+                try {
+                  $desk = 'Registry::HKU\OpDefault\Control Panel\Desktop'
+                  if (-not (Test-Path $desk)) { New-Item -Path $desk -Force | Out-Null }
+                  Set-ItemProperty -Path $desk -Name Wallpaper -Value $wpPath -Force
+                  Set-ItemProperty -Path $desk -Name WallpaperStyle -Value '10' -Force
+                  Set-ItemProperty -Path $desk -Name TileWallpaper -Value '0' -Force
+                } catch {
+                  Write-Host "Default hive wallpaper skip: $($_.Exception.Message)"
+                } finally {
+                  reg unload HKU\OpDefault 2>$null | Out-Null
+                }
+              }
+
+              # Also seed runneradmin profile hive if present
+              foreach ($uHive in @('C:\Users\runneradmin\NTUSER.DAT', 'C:\Users\oprdp\NTUSER.DAT')) {
+                if (-not (Test-Path $uHive)) { continue }
+                $hiveName = 'OpUser' + [guid]::NewGuid().ToString('N').Substring(0,8)
+                reg load "HKU\$hiveName" "$uHive" 2>$null | Out-Null
+                try {
+                  $desk = "Registry::HKU\$hiveName\Control Panel\Desktop"
+                  if (-not (Test-Path $desk)) { New-Item -Path $desk -Force | Out-Null }
+                  Set-ItemProperty -Path $desk -Name Wallpaper -Value $wpPath -Force
+                  Set-ItemProperty -Path $desk -Name WallpaperStyle -Value '10' -Force
+                  Set-ItemProperty -Path $desk -Name TileWallpaper -Value '0' -Force
+                } catch {
+                  Write-Host "User hive wallpaper skip ($uHive): $($_.Exception.Message)"
+                } finally {
+                  reg unload "HKU\$hiveName" 2>$null | Out-Null
+                }
+              }
+
+              Write-Host "0.P wallpaper applied: $wpPath"
+
+              # Startup helper so RDP logons also paint wallpaper
+              $startupDir = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
+              New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
+              $cmdPath = Join-Path $startupDir "0P-set-wallpaper.cmd"
+              $cmdLines = @(
+                '@echo off',
+                ('reg add "HKCU\Control Panel\Desktop" /v Wallpaper /t REG_SZ /d "{0}" /f >nul' -f $wpPath),
+                'reg add "HKCU\Control Panel\Desktop" /v WallpaperStyle /t REG_SZ /d 10 /f >nul',
+                'reg add "HKCU\Control Panel\Desktop" /v TileWallpaper /t REG_SZ /d 0 /f >nul',
+                ('powershell -NoProfile -WindowStyle Hidden -Command "Add-Type -TypeDefinition ''using System.Runtime.InteropServices; public class W {{ [DllImport(\"\"user32.dll\"\",CharSet=CharSet.Auto)] public static extern bool SystemParametersInfo(int a,int b,string c,int d); }}''; [W]::SystemParametersInfo(20,0,''{0}'',3)"' -f $wpPath)
+              )
+              Set-Content -Path $cmdPath -Value $cmdLines -Encoding ASCII
+            } catch {
+              Write-Host "Wallpaper set failed (non-fatal): $($_.Exception.Message)"
+            }
+          }
+
+          function Send-Ready([hashtable]$body) {
+            $readyOk = $false
+            for ($i = 0; $i -lt 5; $i++) {
+              try {
+                $json = ($body | ConvertTo-Json -Compress)
+                Invoke-RestMethod -Uri "$appUrl/api/ready/$handoff" -Method POST -Body $json -ContentType "application/json" -TimeoutSec 20 | Out-Null
+                $readyOk = $true
+                Write-Host "Ready signal sent"
+                break
+              } catch {
+                Write-Host "Ready signal attempt $($i+1) failed: $($_.Exception.Message)"
+                Start-Sleep -Seconds 3
+              }
+            }
+            if (-not $readyOk) { Write-Host "Ready signal ultimately failed" }
+          }
+
+          Set-0PWallpaper -BaseUrl $appUrl
+
+          # ── MODE: Google Chrome Remote Desktop ──────────────────────────────
+          if ($mode -eq 'crd') {
+            Write-Host "Fetching CRD secrets via handoff..."
+            try {
+              $secret = Invoke-RestMethod -Uri "$appUrl/api/handoff/$handoff" -Method GET -TimeoutSec 30
+            } catch {
+              throw "Handoff fetch failed: $($_.Exception.Message)"
+            }
+
+            $inputCode = [string]$secret.code
+            $pin = [string]$secret.pin
+            if ($secret.name) { $nameHint = [string]$secret.name }
+            if (-not $inputCode) { throw "Handoff returned empty CODE" }
+            if (-not $pin) { $pin = "123456" }
+
+            Write-Host "::add-mask::$inputCode"
+            Write-Host "::add-mask::$pin"
+
+            if ($inputCode -match '4/[A-Za-z0-9_\-\.\~]+') {
+                $token = $Matches[0]
+            } else {
+                $token = $inputCode.Trim().Trim("'").Trim('"')
+            }
+            Write-Host "::add-mask::$token"
+
+            Write-Host "Downloading Chrome Remote Desktop..."
+            $msiPath = "$env:TEMP\crd.msi"
+            Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msiPath -UseBasicParsing
+
+            Write-Host "Installing..."
+            Start-Process msiexec.exe -ArgumentList "/i `"$msiPath`" /qn /norestart" -Wait -WindowStyle Hidden
+
+            $paths = @(
+                "${env:ProgramFiles(x86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe",
+                "${env:ProgramFiles}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+            )
+            $exe = $null
+            foreach ($p in $paths) { if (Test-Path $p) { $exe = $p; break } }
+            if (-not $exe) { throw "CRD Executable not found!" }
+
+            Write-Host "Registering host..."
+            $name = $nameHint
+            if (-not $name) { $name = "0P-$tag" }
+            $name = ($name -replace '[^A-Za-z0-9 _\-]', '').Trim()
+            if ($name.Length -lt 3) { $name = "0P-$tag" }
+            if ($name.Length -gt 48) { $name = $name.Substring(0, 48) }
+
+            $proc = Start-Process -FilePath $exe -ArgumentList "--code=`"$token`"", "--redirect-url=`"https://remotedesktop.google.com/_/oauthredirect`"", "--name=`"$name`"", "--pin=`"$pin`"" -PassThru -Wait -WindowStyle Hidden
+            if ($proc.ExitCode -ne 0) {
+                Write-Error "Registration failed with exit code $($proc.ExitCode)"
+                exit 1
+            }
+
+            Write-Host "CRD setup complete. Host name: $name"
+            Send-Ready @{ mode = "crd"; name = $name }
+          }
+
+          function Enable-0PRdpAdmin {
+            $rdpUser = $env:USERNAME
+            if (-not $rdpUser) { $rdpUser = "runneradmin" }
+            try {
+              $who = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+              if ($who -match '\\([^\\]+)$') { $rdpUser = $Matches[1] }
+            } catch {}
+            $rdpPass = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 20 | ForEach-Object { [char]$_ })
+            Write-Host "::add-mask::$rdpPass"
+            Write-Host "RDP will use runner account: $rdpUser"
+
+            Write-Host "Enabling Remote Desktop..."
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+            try {
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1 -Force
+            } catch {}
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+            Start-Service TermService -ErrorAction SilentlyContinue
+            Set-Service TermService -StartupType Automatic -ErrorAction SilentlyContinue
+
+            Write-Host "Setting password on runner admin $rdpUser..."
+            $sec = ConvertTo-SecureString $rdpPass -AsPlainText -Force
+            try {
+              Set-LocalUser -Name $rdpUser -Password $sec -PasswordNeverExpires $true
+            } catch {
+              $net = Start-Process -FilePath "net.exe" -ArgumentList @("user", $rdpUser, $rdpPass) -Wait -PassThru -WindowStyle Hidden
+              if ($net.ExitCode -ne 0) { throw "Failed to set password for $rdpUser" }
+            }
+            try { Add-LocalGroupMember -Group "Remote Desktop Users" -Member $rdpUser -ErrorAction SilentlyContinue } catch {}
+            try { Add-LocalGroupMember -Group "Administrators" -Member $rdpUser -ErrorAction SilentlyContinue } catch {}
+            return @{ User = $rdpUser; Pass = $rdpPass }
+          }
+
+          # ── MODE: Windows RDP + Tailscale (login link) ──────────────────────
+          if ($mode -eq 'rdp') {
+            Write-Host "Consuming handoff (rdp/tailscale ack)..."
+            try {
+              Invoke-RestMethod -Uri "$appUrl/api/handoff/$handoff" -Method GET -TimeoutSec 30 | Out-Null
+            } catch {
+              throw "Handoff fetch failed: $($_.Exception.Message)"
+            }
+
+            $cred = Enable-0PRdpAdmin
+            $rdpUser = $cred.User
+            $rdpPass = $cred.Pass
+            Set-0PWallpaper -BaseUrl $appUrl
+
+            $tsHost = if ($nameHint) { ($nameHint -replace '[^A-Za-z0-9\-]', '-').Trim('-') } else { "0P-$tag" }
+            if ($tsHost.Length -lt 3) { $tsHost = "0P-$tag" }
+            if ($tsHost.Length -gt 48) { $tsHost = $tsHost.Substring(0, 48) }
+
+            Write-Host "Installing Tailscale..."
+            $msi = "$env:TEMP\tailscale-setup.msi"
+            $msiUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+            Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing -TimeoutSec 120
+            Start-Process msiexec.exe -ArgumentList "/i `"$msi`" TS_INSTALLUPDATES=0 /qn /norestart" -Wait -WindowStyle Hidden
+
+            $tsExe = $null
+            foreach ($p in @(
+              "${env:ProgramFiles}\Tailscale\tailscale.exe",
+              "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+            )) {
+              if (Test-Path $p) { $tsExe = $p; break }
+            }
+            if (-not $tsExe) { throw "tailscale.exe not found after install" }
+
+            try { Start-Service -Name "Tailscale" -ErrorAction SilentlyContinue } catch {}
+            Start-Sleep -Seconds 3
+
+            Write-Host "Starting Tailscale login (auth URL for user)..."
+            $tsOut = "$env:TEMP\ts-up.out"
+            $tsErr = "$env:TEMP\ts-up.err"
+            Remove-Item $tsOut, $tsErr -ErrorAction SilentlyContinue
+            $tsProc = Start-Process -FilePath $tsExe -ArgumentList @(
+              "up",
+              "--reset",
+              "--accept-dns=false",
+              "--hostname=$tsHost",
+              "--timeout=0"
+            ) -PassThru -RedirectStandardOutput $tsOut -RedirectStandardError $tsErr -WindowStyle Hidden
+
+            $authUrl = $null
+            for ($i = 0; $i -lt 90; $i++) {
+              Start-Sleep -Seconds 1
+              $blob = ""
+              if (Test-Path $tsOut) { $blob += (Get-Content $tsOut -Raw -ErrorAction SilentlyContinue) }
+              if (Test-Path $tsErr) { $blob += "`n" + (Get-Content $tsErr -Raw -ErrorAction SilentlyContinue) }
+              if ($blob -match 'https://login\.tailscale\.com/a/[A-Za-z0-9]+') {
+                $authUrl = $Matches[0]
+                break
+              }
+              try {
+                $st = & $tsExe status --json 2>$null | ConvertFrom-Json
+                if ($st -and $st.BackendState -eq 'Running') { break }
+              } catch {}
+            }
+
+            if ($authUrl) {
+              Write-Host "Tailscale auth URL captured"
+              Write-Host "::add-mask::$authUrl"
+              Send-Ready @{
+                mode = "rdp"
+                phase = "authorize"
+                tunnel = "tailscale"
+                auth_url = $authUrl
+                name = $nameHint
+              }
+            } else {
+              Write-Host "No auth URL yet — checking if already connected..."
+            }
+
+            Write-Host "Waiting for Tailscale to come online (user must open auth link)..."
+            $tsIp = $null
+            for ($i = 0; $i -lt 600; $i++) {
+              Start-Sleep -Seconds 2
+              try {
+                $st = & $tsExe status --json 2>$null | ConvertFrom-Json
+                if ($st -and $st.BackendState -eq 'Running') {
+                  $tsIp = (& $tsExe ip -4 2>$null | Select-Object -First 1)
+                  if ($tsIp) { $tsIp = $tsIp.Trim(); break }
+                }
+              } catch {}
+              if ($tsProc.HasExited -and -not $authUrl) {
+                $err = ""
+                if (Test-Path $tsErr) { $err = Get-Content $tsErr -Raw -ErrorAction SilentlyContinue }
+                throw "Tailscale up exited before auth: $err"
+              }
+            }
+            if (-not $tsIp) { throw "Tailscale did not come online in time (auth link not completed?)" }
+
+            Write-Host "Tailscale online: $tsIp"
+            Send-Ready @{
+              mode = "rdp"
+              phase = "ready"
+              tunnel = "tailscale"
+              host = $tsIp
+              port = 3389
+              user = $rdpUser
+              password = $rdpPass
+              name = $nameHint
+            }
+          }
+
+          # ── MODE: Windows RDP + bore.pub (no Tailscale) ─────────────────────
+          if ($mode -eq 'bore') {
+            Write-Host "Consuming handoff (bore ack)..."
+            try {
+              Invoke-RestMethod -Uri "$appUrl/api/handoff/$handoff" -Method GET -TimeoutSec 30 | Out-Null
+            } catch {
+              throw "Handoff fetch failed: $($_.Exception.Message)"
+            }
+
+            $cred = Enable-0PRdpAdmin
+            $rdpUser = $cred.User
+            $rdpPass = $cred.Pass
+            Set-0PWallpaper -BaseUrl $appUrl
+
+            Write-Host "Downloading bore..."
+            $boreZip = "$env:TEMP\bore.zip"
+            $boreDir = "$env:TEMP\bore"
+            New-Item -ItemType Directory -Force -Path $boreDir | Out-Null
+            $boreUrl = "https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-pc-windows-msvc.zip"
+            Invoke-WebRequest -Uri $boreUrl -OutFile $boreZip -UseBasicParsing -TimeoutSec 120
+            Expand-Archive -Path $boreZip -DestinationPath $boreDir -Force
+            $boreExe = Get-ChildItem -Path $boreDir -Recurse -Filter "bore.exe" | Select-Object -First 1
+            if (-not $boreExe) { throw "bore.exe not found after download" }
+
+            Write-Host "Starting bore tunnel 3389 -> bore.pub..."
+            $boreLog = "$env:TEMP\bore.log"
+            $boreErr = "$env:TEMP\bore.err"
+            $boreProc = Start-Process -FilePath $boreExe.FullName -ArgumentList "local","3389","--to","bore.pub" -PassThru -RedirectStandardOutput $boreLog -RedirectStandardError $boreErr -WindowStyle Hidden
+
+            $tunnelHost = "bore.pub"
+            $tunnelPort = $null
+            for ($i = 0; $i -lt 45; $i++) {
+              Start-Sleep -Seconds 1
+              if (Test-Path $boreLog) {
+                $txt = Get-Content $boreLog -Raw -ErrorAction SilentlyContinue
+                if ($txt -match 'listening at bore\.pub:(\d+)' -or $txt -match 'bore\.pub:(\d+)') {
+                  $tunnelPort = [int]$Matches[1]
+                  break
+                }
+              }
+              if ($boreProc.HasExited) {
+                $err = Get-Content $boreErr -Raw -ErrorAction SilentlyContinue
+                throw "bore exited early: $err"
+              }
+            }
+            if (-not $tunnelPort) { throw "Could not parse bore.pub port from output" }
+            Write-Host "Tunnel ready: ${tunnelHost}:$tunnelPort"
+
+            Send-Ready @{
+              mode = "bore"
+              phase = "ready"
+              tunnel = "bore"
+              host = $tunnelHost
+              port = $tunnelPort
+              user = $rdpUser
+              password = $rdpPass
+              name = $nameHint
+            }
+          }
+
+          Hide-DesktopNoise
+          while ($true) {
+              try { Hide-DesktopNoise } catch {}
+              Start-Sleep -Seconds 15
+          }
